@@ -10,6 +10,7 @@ from email.mime.image import MIMEImage # 用于 PNG 图片
 from email.mime.application import MIMEApplication # 用于 HTML 文件
 import time
 from typing import Optional # 引入类型提示
+import requests # 用于 HTTP 请求
 
 # --- Selenium 导入 ---
 from selenium import webdriver
@@ -31,14 +32,14 @@ DB_CONFIG = {
 # 2. 邮件配置
 EMAIL_CONFIG = {
     "smtp_server": "127.0.0.1",  # 例如: smtp.gmail.com
-    "smtp_port": 465,                         # 或 465 (取决于提供商)
-    "smtp_username": "admin",
+    "smtp_port": 25,                         # 或 465 (取决于提供商)
+    "smtp_username": "test",
     "smtp_password": "123456", # 推荐使用应用专用密码
     "recipient_email": "test@test.com"
 }
 
 # 3. 文件路径配置
-OUTPUT_DIR = "traccar_reports"
+OUTPUT_DIR = "/Script/traccar_report/traccar_reports"
 
 
 # 高度范围 (meters)
@@ -48,9 +49,59 @@ BASE_ICON_SIZE = 20
 MAX_SIZE_INCREASE = 15
 
 # 速度范围 (knots)
-MAX_SPEED = 50.0 # 假设最高速度为 50 节，您可以根据实际情况调整
+MAX_SPEED = 50.0  # 假设最高速度为 50 节
+# 红色亮度通道的范围控制：
+MIN_RED_VALUE = 40  # 速度快时的最低红色亮度 (最暗/最浅)
+MAX_RED_VALUE = 255 # 速度慢时的最高红色亮度 (最亮/最鲜艳)
 
 # --- 辅助函数：数据库和日期处理 (代码不变) ---
+
+def send_http_notification(png_path, device_name):
+    """
+    使用 requests 库发送 HTTP POST 请求，上传 PNG 文件。
+    """
+    URL = "http://192.168.1.1:80"
+    
+    # 1. 准备表单数据 (模拟 curl -F 参数)
+    data = {
+        "usr": "test",
+        "from": "Traccar",
+        "msg": f"Report for {device_name}: {os.path.basename(png_path)}",
+    }
+    
+    # 2. 准备文件数据 (模拟 curl -F file=@...)
+    # requests 要求文件以 (文件名, 文件数据) 的格式提供
+    # 我们以二进制读取模式 ('rb') 打开文件
+    try:
+        with open(png_path, 'rb') as f:
+            files = {
+                'file': (os.path.basename(png_path), f)
+            }
+            
+            print(f"Executing HTTP POST to {URL} with file {os.path.basename(png_path)}...")
+            
+            # 3. 发送请求，设置超时为 300 秒
+            response = requests.post(
+                URL, 
+                data=data, 
+                files=files,
+                timeout=300 
+            )
+
+            # 4. 检查响应结果
+            if response.status_code == 200:
+                print(f"HTTP POST success (Status: 200). Response: {response.text.strip()}")
+            else:
+                print(f"HTTP POST failed (Status: {response.status_code}). Response: {response.text.strip()}")
+                
+    except requests.exceptions.Timeout:
+        print("HTTP POST failed: Request timed out after 300 seconds.")
+    except requests.exceptions.ConnectionError:
+        print(f"HTTP POST failed: Could not connect to {URL}. Check network and server status.")
+    except FileNotFoundError:
+        print(f"HTTP POST failed: PNG file not found at {png_path}.")
+    except Exception as e:
+        print(f"An unexpected error occurred during HTTP POST: {e}")
 
 def get_report_time_range(target_date_str: Optional[str] = None):
     """
@@ -135,8 +186,8 @@ def html_to_png(html_path, png_path):
         chrome_options.add_argument("--window-size=1920,1080")
         
         # === 重点：添加代理配置 ===
-        PROXY_SERVER = "127.0.0.1:8080"
-        # 使用 --proxy-server 命令行参数来指定代理地址，如果不需要使用proxy可以注释以下2行
+        PROXY_SERVER = "192.168.103.1:8888"
+        # 使用 --proxy-server 命令行参数来指定代理地址
         chrome_options.add_argument(f'--proxy-server={PROXY_SERVER}')
         print(f"Configured Chromium to use proxy: http://{PROXY_SERVER}")
         # ==========================
@@ -170,22 +221,30 @@ def html_to_png(html_path, png_path):
     return png_path
 
 def get_color(speed):
-    """根据速度返回颜色 (从绿色到红色)"""
-    # 将速度归一化到 [0, 1] 范围
+    """
+    根据速度返回纯红色系的颜色：
+    - 速度快: R 接近 MIN_RED_VALUE -> 颜色暗淡 (暗红)
+    - 速度慢: R 接近 MAX_RED_VALUE -> 颜色鲜艳 (鲜红)
+    """
+    
+    # 1. 将速度归一化到 [0, 1] 范围
     normalized_speed = min(speed, MAX_SPEED) / MAX_SPEED
     
-    # 使用 HSL 或简单的 RGB 线性插值
-    # 0 (低速) -> Green (0, 255, 0)
-    # 1 (高速) -> Red (255, 0, 0)
+    # 2. 关键：反转归一化速度 (1 - normalized_speed)
+    #   - 速度快 (≈1) -> 反转后 ≈ 0
+    #   - 速度慢 (≈0) -> 反转后 ≈ 1
+    inverse_speed = 1 - normalized_speed
     
-    # 红色分量从 0 逐渐增加到 255
-    R = int(255 * normalized_speed)
-    # 绿色分量从 255 逐渐减少到 0
-    G = int(255 * (1 - normalized_speed))
-    B = 0
+    # 3. 将反转后的值映射到红色亮度范围 [MIN_RED_VALUE, MAX_RED_VALUE]
+    # R 值随着 inverse_speed (即速度的减慢) 而增加
+    R = int(MIN_RED_VALUE + inverse_speed * (MAX_RED_VALUE - MIN_RED_VALUE))
     
+    # 4. 保持 G 和 B 通道为 0
+    G = 0 
+    B = 0 
+    
+    # 返回十六进制颜色代码
     return f'#{R:02x}{G:02x}{B:02x}'
-
 
 def get_icon_size(altitude):
     """根据高度返回图标大小 (在 BASE_ICON_SIZE 和 MAX_SIZE_INCREASE 之间变化)"""
@@ -230,9 +289,11 @@ def create_track_map(df, device_name, date_str):
 
         marker_color = get_color(speed)
         icon_size = get_icon_size(altitude)
+
+        css_angle = (course-90) % 360
         
         svg_icon = f"""
-        <div style="transform: rotate({course}deg); color: {marker_color}; font-size: {icon_size[0]}px; line-height: 1;">
+        <div style="transform: rotate({css_angle}deg); color: {marker_color}; font-size: {icon_size[0]}px; line-height: 1;">
             &#x27a4; 
         </div>
         """
@@ -392,10 +453,13 @@ def main():
                 attachment_paths
             )
             
+            # 7. 执行 HTTP POST 请求，上传 PNG 文件
+            send_http_notification(png_path, device_name) 
+            
             # --- 清理生成的文件 ---
             try:
-                #os.remove(png_path)
-                #os.remove(html_path)
+                os.remove(png_path)
+                os.remove(html_path)
                 print(f"Cleaned up temporary files for {device_name}.")
             except OSError as e:
                 print(f"Error cleaning up files: {e}")
